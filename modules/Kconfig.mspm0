@@ -19,4 +19,7 @@ config USE_MSPM0_DL_I2C
 	bool
 
 config USE_MSPM0_DL_ADC
+    bool
+
+config USE_MSPM0_DL_SPI
 	bool
