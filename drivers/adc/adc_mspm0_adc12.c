@@ -18,6 +18,9 @@ LOG_MODULE_REGISTER(adc_mspm0);
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/regulator.h>
+#include <zephyr/drivers/clock_control.h>
+#include <zephyr/dt-bindings/clock/mspm0_clock.h>
+#include <zephyr/drivers/clock_control/mspm0_clock_control.h>
 
 #include <ti/driverlib/dl_adc12.h>
 
@@ -42,6 +45,8 @@ LOG_MODULE_REGISTER(adc_mspm0);
 #define ADC_MSPM0_VREF_MULTIPLIER        1000
 #define ADC_MSPM0_SCOMP0                 0
 #define ADC_MSPM0_SCOMP1                 1
+#define ADC_MSPM0_WAKEUP_TIME_NS         50000
+#define ADC_MSPM0_NS_PER_SEC             1000000000
 #define INT_VREF                         BIT(0)
 #define EXT_VREF                         BIT(1)
 
@@ -125,18 +130,29 @@ static void adc_context_update_buffer_pointer(struct adc_context *ctx, bool repe
 	}
 }
 
-static int adc_mspm0_validate_sampling_time(uint16_t acq_time)
+static int adc_mspm0_validate_sampling_time(const struct adc_mspm0_cfg *config, uint16_t acq_time)
 {
+	uint32_t clock_rate;
+	uint32_t period_ns;
+	int ret;
+	uint8_t wakeup_cycles;
+
+	period_ns = ADC_MSPM0_NS_PER_SEC / (32000000 / 1);
+	/* Wakup time is 5us for both l and g mspm0 series */
+	wakeup_cycles = ADC_MSPM0_WAKEUP_TIME_NS / period_ns;
+
 	if (acq_time == ADC_ACQ_TIME_DEFAULT) {
-		return 0;
+		return wakeup_cycles;
 	}
 
+	acq_time = acq_time + wakeup_cycles;
 	if ((ADC_ACQ_TIME_UNIT(acq_time) == ADC_ACQ_TIME_TICKS) &&
-	    (ADC_ACQ_TIME_VALUE(acq_time) <= ADC12_SCOMP0_VAL_MASK)) {
+		(ADC_ACQ_TIME_VALUE(acq_time) <= ADC12_SCOMP0_VAL_MASK)) {
 		return ADC_ACQ_TIME_VALUE(acq_time);
+	} else {
+		return -EINVAL;
 	}
-
-	return -EINVAL;
+	
 }
 
 static int adc_mspm0_channel_setup(const struct device *dev,
@@ -164,7 +180,7 @@ static int adc_mspm0_channel_setup(const struct device *dev,
 		return -EINVAL;
 	}
 
-	sampling_time = adc_mspm0_validate_sampling_time(channel_cfg->acquisition_time);
+	sampling_time = adc_mspm0_validate_sampling_time(dev->config, channel_cfg->acquisition_time);
 	if (sampling_time < 0) {
 		return sampling_time;
 	}
@@ -432,7 +448,9 @@ static int adc_mspm0_read_internal(const struct device *dev, const struct adc_se
 	}
 
 	adc_context_start_read(&data->ctx, sequence);
-	return adc_context_wait_for_completion(&data->ctx);
+	adc_context_wait_for_completion(&data->ctx);
+	DL_ADC12_disableConversions(config->base);
+	return 0;
 }
 
 static int adc_mspm0_read(const struct device *dev, const struct adc_sequence *sequence)
