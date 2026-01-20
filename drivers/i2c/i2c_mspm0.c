@@ -24,7 +24,7 @@ LOG_MODULE_REGISTER(i2c_mspm0, CONFIG_I2C_LOG_LEVEL);
 
 #define TI_MSPM0_CONTROLLER_INTERRUPTS                                                             \
 	(DL_I2C_INTERRUPT_CONTROLLER_ARBITRATION_LOST | DL_I2C_INTERRUPT_CONTROLLER_NACK |         \
-	 DL_I2C_INTERRUPT_CONTROLLER_RXFIFO_TRIGGER | DL_I2C_INTERRUPT_CONTROLLER_RX_DONE |        \
+	 DL_I2C_INTERRUPT_CONTROLLER_RXFIFO_TRIGGER | DL_I2C_INTERRUPT_CONTROLLER_STOP |        \
 	 DL_I2C_INTERRUPT_CONTROLLER_TX_DONE | DL_I2C_INTERRUPT_TIMEOUT_A)
 
 #define TI_MSPM0_TARGET_INTERRUPTS                                                                 \
@@ -43,9 +43,8 @@ enum i2c_mspm0_state {
 	I2C_MSPM0_TARGET_STARTED,
 	I2C_MSPM0_TARGET_TX_INPROGRESS,
 	I2C_MSPM0_TARGET_RX_INPROGRESS,
-	I2C_MSPM0_TARGET_PREEMPTED,
 	I2C_MSPM0_TIMEOUT,
-	I2C_MSPM0_ERROR
+	I2C_MSPM0_ERROR,
 };
 
 struct i2c_mspm0_config {
@@ -53,7 +52,7 @@ struct i2c_mspm0_config {
 	uint32_t bitrate;
 	uint32_t merge_buf_size;
 	uint8_t *merge_buf;
-	DL_I2C_ClockConfig gI2CClockConfig;
+	DL_I2C_ClockConfig i2c_clock_config;
 	const struct mspm0_sys_clock *clock_subsys;
 	const struct pinctrl_dev_config *pinctrl;
 	void (*irq_config_func)(const struct device *dev);
@@ -67,7 +66,7 @@ struct i2c_mspm0_data {
 	uint32_t transfer_count;
 	uint32_t transfer_len;
 	uint8_t *msg_buf;
-#ifdef CONFIG_I2C_TARGET
+#if (IS_ENABLED(CONFIG_I2C_TARGET))
 	struct i2c_target_config *target_config;
 	const struct i2c_target_callbacks *target_callbacks;
 #endif /* CONFIG_I2C_TARGET */
@@ -99,7 +98,6 @@ static int i2c_mspm0_configure_timeout(const struct device *dev, uint32_t period
 	ticks_needed = (timeout_cycles + tick_cycles - 1) / tick_cycles;
 	/* Lower 4-bits of counter are automatically set to 0x0 */
 	counter_value = ticks_needed >> 4;
-
 	if (counter_value > 0xFF) {
 		return -EINVAL;
 	}
@@ -120,19 +118,16 @@ static int i2c_mspm0_configure(const struct device *dev, uint32_t dev_config)
 	int32_t period;
 	int ret;
 
-	ret = clock_control_get_rate(clk_dev, (clock_control_subsys_t)config->clock_subsys,
-				     &clock_rate);
-	if (ret < 0) {
-		ret = -ENODEV;
-		goto out;
-	}
-
 	if (dev_config & I2C_MSG_ADDR_10_BITS) {
 		ret = -EINVAL;
 		goto out;
 	}
 
-	k_sem_take(data->i2c_busy_sem, K_FOREVER);
+	ret = clock_control_get_rate(clk_dev, (clock_control_subsys_t)config->clock_subsys,
+				     &clock_rate);
+	if (ret < 0) {
+		goto out;
+	}
 
 	/* Config I2C speed */
 	switch (I2C_SPEED_GET(dev_config)) {
@@ -144,7 +139,7 @@ static int i2c_mspm0_configure(const struct device *dev, uint32_t dev_config)
 		break;
 	default:
 		ret = -EINVAL;
-		goto sem_give;
+		goto out;
 	}
 
 	/* Calculate the timer period based on the desired speed and clock rate.
@@ -156,14 +151,24 @@ static int i2c_mspm0_configure(const struct device *dev, uint32_t dev_config)
 	/* Set the I2C speed */
 	if (period <= 0) {
 		ret = -EINVAL;
-		goto sem_give;
+		goto out;
+	}
+
+	data->dev_config = dev_config;
+
+	ret = k_sem_take(data->i2c_busy_sem, K_SECONDS(2));
+
+	if (ret != 0) {
+		goto out;
 	}
 
 	DL_I2C_setTimerPeriod(config->base, period);
-	data->dev_config = dev_config;
 
 #if (CONFIG_I2C_SCL_LOW_TIMEOUT != 0)
 	ret = i2c_mspm0_configure_timeout(dev, period, CONFIG_I2C_SCL_LOW_TIMEOUT);
+	if (ret < 0) {
+		goto sem_give;
+	}
 #endif /* CONFIG_I2C_SCL_LOW_TIMEOUT */
 
 	/* Config other settings */
@@ -177,51 +182,25 @@ static int i2c_mspm0_configure(const struct device *dev, uint32_t dev_config)
 	/* Enable module */
 	DL_I2C_enableController(config->base);
 
+
+	data->state = I2C_MSPM0_IDLE;
+
 sem_give:
 	k_sem_give(data->i2c_busy_sem);
 out:
 	return ret;
 }
 
-static int i2c_mspm0_init(const struct device *dev)
-{
-	const struct i2c_mspm0_config *config = dev->config;
-	int ret;
-	uint32_t speed_config;
-
-	/* Init power */
-	DL_I2C_reset(config->base);
-	DL_I2C_enablePower(config->base);
-	delay_cycles(CONFIG_MSPM0_PERIPH_STARTUP_DELAY);
-	DL_I2C_resetControllerTransfer(config->base);
-#ifdef CONFIG_I2C_TARGET
-	/* Workaround for errata I2C_ERR_04 */
-	DL_I2C_disableTargetWakeup(config->base);
-#endif
-	/* Init GPIO */
-	ret = pinctrl_apply_state(config->pinctrl, PINCTRL_STATE_DEFAULT);
-	if (ret < 0) {
-		return ret;
-	}
-
-	/* Config clocks and analog filter */
-	DL_I2C_setClockConfig(config->base, &config->gI2CClockConfig);
-	DL_I2C_disableAnalogGlitchFilter(config->base);
-
-	/* Set frequency */
-	speed_config = i2c_map_dt_bitrate(config->bitrate);
-	i2c_mspm0_configure(dev, speed_config);
-
-	/* Enable interrupts */
-	config->irq_config_func(dev);
-
-	return 0;
-}
-
 static int i2c_mspm0_get_config(const struct device *dev, uint32_t *dev_config)
 {
 	struct i2c_mspm0_data *data = dev->data;
+
+	if (!data->dev_config) {
+		return -EIO;
+	}
+
 	*dev_config = data->dev_config;
+
 	return 0;
 }
 
@@ -239,7 +218,7 @@ static int i2c_mspm0_reset_peripheral_controller(const struct device *dev)
 	DL_I2C_disableTargetWakeup(config->base);
 
 	/* Config clocks and analog filter */
-	DL_I2C_setClockConfig(config->base, &config->gI2CClockConfig);
+	DL_I2C_setClockConfig(config->base, &config->i2c_clock_config);
 	DL_I2C_disableAnalogGlitchFilter(config->base);
 
 	/* Configure Controller Mode */
@@ -264,16 +243,32 @@ static int i2c_mspm0_receive(const struct device *dev, struct i2c_msg msg, uint1
 {
 	const struct i2c_mspm0_config *config = dev->config;
 	struct i2c_mspm0_data *data = dev->data;
+	DL_I2C_CONTROLLER_STOP stop;
+	int ret = 0;
 
 	/* Send a read request to Target */
 	data->msg_buf = msg.buf;
 	data->transfer_count = 0;
-	data->transfer_count = msg.len;
+	data->transfer_len = msg.len;
 	data->state = I2C_MSPM0_RX_STARTED;
-	DL_I2C_startControllerTransfer(config->base, addr, DL_I2C_CONTROLLER_DIRECTION_RX, msg.len);
+
+	if (msg.flags & I2C_MSG_STOP) {
+		stop = DL_I2C_CONTROLLER_STOP_ENABLE;
+	} else {
+		stop = DL_I2C_CONTROLLER_STOP_DISABLE;
+	}
+
+	DL_I2C_startControllerTransferAdvanced(config->base, addr, DL_I2C_CONTROLLER_DIRECTION_RX,
+				data->transfer_len, DL_I2C_CONTROLLER_START_ENABLE, stop,
+				DL_I2C_CONTROLLER_ACK_DISABLE);
+
 
 	/* Wait for the read to complete */
-	k_sem_take(data->device_sync_sem, K_FOREVER);
+	ret = k_sem_take(data->device_sync_sem, K_FOREVER);
+	if(ret != 0) {
+		printk("failed to take device_sync_sem in i2c_mspm0_receive\n");
+		return ret;
+	}
 
 	if (data->state == I2C_MSPM0_TIMEOUT) {
 		return -ETIMEDOUT;
@@ -285,8 +280,6 @@ static int i2c_mspm0_receive(const struct device *dev, struct i2c_msg msg, uint1
 		return -EIO;
 	}
 
-	k_sem_reset(data->device_sync_sem);
-
 	return 0;
 }
 
@@ -294,11 +287,18 @@ static int i2c_mspm0_transmit(const struct device *dev, struct i2c_msg msg, uint
 {
 	const struct i2c_mspm0_config *config = dev->config;
 	struct i2c_mspm0_data *data = dev->data;
+	DL_I2C_CONTROLLER_STOP stop;
+	int ret = 0;
 
 	data->msg_buf = msg.buf;
 	data->transfer_count = 0;
 	data->transfer_len = msg.len;
 	data->state = I2C_MSPM0_IDLE;
+
+	/* Flush anything that is left in the stale FIFO */
+    // DL_I2C_startFlushControllerTXFIFO(config->base);
+    // k_sleep(K_SECONDS(2));
+    // DL_I2C_stopFlushControllerTXFIFO(config->base);
 
 	/* Flush anything that is left in the stale FIFO */
 	DL_I2C_flushControllerTXFIFO(config->base);
@@ -316,12 +316,25 @@ static int i2c_mspm0_transmit(const struct device *dev, struct i2c_msg msg, uint
 		DL_I2C_disableInterrupt(config->base, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER);
 	}
 
+	if (msg.flags & I2C_MSG_STOP) {
+		stop = DL_I2C_CONTROLLER_STOP_ENABLE;
+	} else {
+		stop = DL_I2C_CONTROLLER_STOP_DISABLE;
+	}
+
 	data->state = I2C_MSPM0_TX_STARTED;
-	DL_I2C_startControllerTransfer(config->base, addr, DL_I2C_CONTROLLER_DIRECTION_TX,
-				       data->transfer_len);
+	DL_I2C_startControllerTransferAdvanced(config->base, addr, DL_I2C_CONTROLLER_DIRECTION_TX,
+				data->transfer_len, DL_I2C_CONTROLLER_START_ENABLE, stop,
+				DL_I2C_CONTROLLER_ACK_ENABLE);
+	
 
 	/* Wait for the transmit to complete */
-	k_sem_take(data->device_sync_sem, K_FOREVER);
+	ret = k_sem_take(data->device_sync_sem, K_SECONDS(2));
+
+	if(ret != 0) {
+		printk("failed to take sync sem in i2c_mspm0_transmit. data_state: %d\n", data->state);
+		return ret;
+	}
 
 	if (data->state == I2C_MSPM0_TIMEOUT) {
 		return -ETIMEDOUT;
@@ -332,7 +345,6 @@ static int i2c_mspm0_transmit(const struct device *dev, struct i2c_msg msg, uint
 		return -EIO;
 	}
 
-	k_sem_reset(data->device_sync_sem);
 
 	return 0;
 }
@@ -349,14 +361,11 @@ static int i2c_mspm0_transfer(const struct device *dev, struct i2c_msg *msgs, ui
 	uint8_t *transaction_buf;
 	uint16_t transaction_len;
 	struct i2c_msg transaction_msg;
-	int j;
 	int ret = 0;
-
-	k_sem_take(data->i2c_busy_sem, K_FOREVER);
+	int sem_success = 0;
 
 	if (data->is_target) {
 		/* Currently target is registered, initiating transfer is not allowed */
-		k_sem_give(data->i2c_busy_sem);
 		return -EBUSY;
 	}
 
@@ -401,6 +410,13 @@ static int i2c_mspm0_transfer(const struct device *dev, struct i2c_msg *msgs, ui
 		transaction_msg.buf = transaction_buf;
 		transaction_msg.len = transaction_len;
 
+		sem_success = k_sem_take(data->i2c_busy_sem, K_SECONDS(2));
+
+		if (sem_success != 0) {
+			ret = sem_success;
+		}
+
+
 		if ((msgs[i].flags & I2C_MSG_RW_MASK) == I2C_MSG_READ) {
 			ret = i2c_mspm0_receive(dev, transaction_msg, addr);
 		} else {
@@ -413,8 +429,9 @@ static int i2c_mspm0_transfer(const struct device *dev, struct i2c_msg *msgs, ui
 
 		/* For merged reads, populate data in original user buffers */
 		if ((transaction_msg.flags & I2C_MSG_READ) && (transaction_buf == internal_buf)) {
-			j = i;
-			while (current_internal_buf_size >= msgs[j].len) {
+			int j = i;
+
+			while (j >= 0 && current_internal_buf_size >= msgs[j].len) {
 				current_internal_buf_size -= msgs[j].len;
 				memcpy(msgs[j].buf, transaction_buf + current_internal_buf_size,
 				       msgs[j].len);
@@ -423,6 +440,8 @@ static int i2c_mspm0_transfer(const struct device *dev, struct i2c_msg *msgs, ui
 		}
 		/* Safe to reset internal buffer size back to 0 at this point */
 		current_internal_buf_size = 0;
+
+		k_sem_give(data->i2c_busy_sem);
 	}
 
 	if (ret == -ETIMEDOUT) {
@@ -439,24 +458,24 @@ static int i2c_mspm0_transfer(const struct device *dev, struct i2c_msg *msgs, ui
 	return ret;
 }
 
-#ifdef CONFIG_I2C_TARGET
+#if (IS_ENABLED(CONFIG_I2C_TARGET))
 static int i2c_mspm0_target_register(const struct device *dev, struct i2c_target_config *cfg)
 {
 	const struct i2c_mspm0_config *config = dev->config;
 	struct i2c_mspm0_data *data = dev->data;
 
+	if (data->state != I2C_MSPM0_IDLE) {
+		return -EBUSY;
+	}
+
 	/* Device is already registered as target */
-	if (data->is_target == true || data->target_config == cfg) {
+	if (data->is_target || data->target_config == cfg) {
 		return -EINVAL;
 	}
 
+	k_sem_take(data->i2c_busy_sem, K_FOREVER);
 	data->target_config = cfg;
 	data->target_callbacks = cfg->callbacks;
-	k_sem_take(data->i2c_busy_sem, K_FOREVER);
-
-	if (data->state == I2C_MSPM0_TARGET_PREEMPTED) {
-		DL_I2C_clearInterruptStatus(config->base, TI_MSPM0_TARGET_INTERRUPTS);
-	}
 
 	DL_I2C_disableController(config->base);
 	DL_I2C_disableInterrupt(config->base, TI_MSPM0_CONTROLLER_INTERRUPTS);
@@ -468,13 +487,12 @@ static int i2c_mspm0_target_register(const struct device *dev, struct i2c_target
 	DL_I2C_enableTargetClockStretching(config->base);
 	DL_I2C_setTargetOwnAddress(config->base, data->target_config->address);
 
-	DL_I2C_clearInterruptStatus(config->base, DL_I2C_INTERRUPT_TARGET_TXFIFO_EMPTY);
+	DL_I2C_clearInterruptStatus(config->base, TI_MSPM0_TARGET_INTERRUPTS);
 	DL_I2C_enableInterrupt(config->base, TI_MSPM0_TARGET_INTERRUPTS);
 	DL_I2C_enableTarget(config->base);
 
 	data->dev_config &= ~I2C_MODE_CONTROLLER;
 	data->is_target = true;
-	data->state = I2C_MSPM0_IDLE;
 
 	k_sem_give(data->i2c_busy_sem);
 	return 0;
@@ -489,9 +507,9 @@ static int i2c_mspm0_target_unregister(const struct device *dev, struct i2c_targ
 		return 0;
 	}
 
+	k_sem_take(data->i2c_busy_sem, K_FOREVER);
 	data->target_config = NULL;
 	data->is_target = false;
-	k_sem_take(data->i2c_busy_sem, K_FOREVER);
 
 	DL_I2C_disableTarget(config->base);
 	DL_I2C_disableInterrupt(config->base, TI_MSPM0_TARGET_INTERRUPTS);
@@ -514,7 +532,7 @@ static int i2c_mspm0_reset_peripheral_target(const struct device *dev)
 	DL_I2C_disableTargetWakeup(config->base);
 
 	/* Config clocks and analog filter */
-	DL_I2C_setClockConfig(config->base, (DL_I2C_ClockConfig *)&config->gI2CClockConfig);
+	DL_I2C_setClockConfig(config->base, (DL_I2C_ClockConfig *)&config->i2c_clock_config);
 	DL_I2C_disableAnalogGlitchFilter(config->base);
 
 	DL_I2C_setTargetOwnAddress(config->base, data->target_config->address);
@@ -534,70 +552,16 @@ static int i2c_mspm0_reset_peripheral_target(const struct device *dev)
 
 	return 0;
 }
-#endif /* CONFIG_I2C_TARGET */
 
-static void i2c_mspm0_isr(const struct device *dev)
+static void i2c_mspm0_isr_target(const struct device *dev)
 {
 	const struct i2c_mspm0_config *config = dev->config;
 	struct i2c_mspm0_data *data = dev->data;
-#ifdef CONFIG_I2C_TARGET
 	int ret;
-	uint8_t txByte;
-	uint8_t rxByte;
-#endif
+	uint8_t tx_byte;
+	uint8_t rx_byte;
 
 	switch (DL_I2C_getPendingInterrupt(config->base)) {
-	case DL_I2C_IIDX_CONTROLLER_RX_DONE:
-		data->state = I2C_MSPM0_RX_COMPLETE;
-		k_sem_give(data->device_sync_sem);
-		break;
-	case DL_I2C_IIDX_CONTROLLER_TX_DONE:
-		DL_I2C_disableInterrupt(config->base, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER);
-		data->state = I2C_MSPM0_TX_COMPLETE;
-		k_sem_give(data->device_sync_sem);
-		break;
-	case DL_I2C_IIDX_CONTROLLER_RXFIFO_TRIGGER:
-		if (data->state != I2C_MSPM0_RX_COMPLETE) {
-			/* Fix for RX_DONE happening before the last RXFIFO_TRIGGER */
-			data->state = I2C_MSPM0_RX_INPROGRESS;
-		}
-		/* Receive all bytes from target */
-		while (DL_I2C_isControllerRXFIFOEmpty(config->base) != true) {
-			if (data->transfer_count < data->transfer_len) {
-				data->msg_buf[data->transfer_count++] =
-					DL_I2C_receiveControllerData(config->base);
-			} else {
-				/* Ignore if transaction length exceeded */
-				DL_I2C_receiveControllerData(config->base);
-			}
-		}
-		break;
-	case DL_I2C_IIDX_CONTROLLER_TXFIFO_TRIGGER:
-		data->state = I2C_MSPM0_TX_INPROGRESS;
-		/* Fill TX FIFO with next bytes to send */
-		if (data->transfer_count < data->transfer_len) {
-			data->transfer_count += DL_I2C_fillControllerTXFIFO(
-				config->base, &data->msg_buf[data->transfer_count],
-				data->transfer_len - data->transfer_count);
-		}
-		break;
-	case DL_I2C_IIDX_CONTROLLER_ARBITRATION_LOST:
-	case DL_I2C_IIDX_CONTROLLER_NACK:
-		if ((data->state == I2C_MSPM0_RX_STARTED) ||
-		    (data->state == I2C_MSPM0_TX_STARTED)) {
-			/* NACK interrupt if I2C Target is disconnected */
-			data->state = I2C_MSPM0_ERROR;
-		}
-
-	/* Not implemented */
-	case DL_I2C_IIDX_CONTROLLER_RXFIFO_FULL:
-	case DL_I2C_IIDX_CONTROLLER_TXFIFO_EMPTY:
-	case DL_I2C_IIDX_CONTROLLER_START:
-	case DL_I2C_IIDX_CONTROLLER_STOP:
-	case DL_I2C_IIDX_CONTROLLER_EVENT1_DMA_DONE:
-	case DL_I2C_IIDX_CONTROLLER_EVENT2_DMA_DONE:
-		break;
-#ifdef CONFIG_I2C_TARGET
 	case DL_I2C_IIDX_TARGET_START:
 		data->state = I2C_MSPM0_TARGET_STARTED;
 		/* Flush TX FIFO to clear out any stale data */
@@ -622,9 +586,9 @@ static void i2c_mspm0_isr(const struct device *dev)
 		/* Store received data in buffer */
 		if (data->target_callbacks->write_received != NULL) {
 			while (DL_I2C_isTargetRXFIFOEmpty(config->base) != true) {
-				rxByte = DL_I2C_receiveTargetData(config->base);
+				rx_byte = DL_I2C_receiveTargetData(config->base);
 				ret = data->target_callbacks->write_received(data->target_config,
-									     rxByte);
+									     rx_byte);
 				if (ret == 0) {
 					DL_I2C_setTargetACKOverrideValue(
 						config->base,
@@ -647,9 +611,9 @@ static void i2c_mspm0_isr(const struct device *dev)
 			data->state = I2C_MSPM0_TARGET_TX_INPROGRESS;
 			if (data->target_callbacks->read_requested != NULL) {
 				ret = data->target_callbacks->read_requested(data->target_config,
-									     &txByte);
+									     &tx_byte);
 				if (ret == 0) {
-					DL_I2C_transmitTargetData(config->base, txByte);
+					DL_I2C_transmitTargetData(config->base, tx_byte);
 				} else {
 					/* In this case, no new data is desired to be filled, thus
 					 * 0's are transmitted
@@ -671,10 +635,10 @@ static void i2c_mspm0_isr(const struct device *dev)
 			 */
 			if (data->target_callbacks->read_processed != NULL) {
 				ret = data->target_callbacks->read_processed(data->target_config,
-									     &txByte);
+									     &tx_byte);
 
 				if (ret == 0) {
-					DL_I2C_transmitTargetData(config->base, txByte);
+					DL_I2C_transmitTargetData(config->base, tx_byte);
 				} else {
 					/* In this case, no new data is desired to be filled, thus
 					 * 0's are transmitted
@@ -696,37 +660,129 @@ static void i2c_mspm0_isr(const struct device *dev)
 			data->target_callbacks->stop(data->target_config);
 		}
 		break;
-	case DL_I2C_IIDX_TARGET_RXFIFO_TRIGGER:
-	case DL_I2C_IIDX_TARGET_RXFIFO_FULL:
-	case DL_I2C_IIDX_TARGET_GENERAL_CALL:
-	case DL_I2C_IIDX_TARGET_EVENT1_DMA_DONE:
-	case DL_I2C_IIDX_TARGET_EVENT2_DMA_DONE:
-		break;
-#endif /* CONFIG_I2C_TARGET */
 	case DL_I2C_IIDX_TIMEOUT_A:
-		data->state = I2C_MSPM0_TIMEOUT;
-
-		if (data->is_target == false) {
-			DL_I2C_disableInterrupt(config->base, TI_MSPM0_CONTROLLER_INTERRUPTS);
-			DL_I2C_clearInterruptStatus(config->base, TI_MSPM0_CONTROLLER_INTERRUPTS);
-			DL_I2C_flushControllerTXFIFO(config->base);
-
+		DL_I2C_disableInterrupt(config->base, TI_MSPM0_TARGET_INTERRUPTS);
+		DL_I2C_clearInterruptStatus(config->base, TI_MSPM0_TARGET_INTERRUPTS);
+		if (data->target_callbacks->stop) {
+			data->target_callbacks->stop(data->target_config);
 		}
-#ifdef CONFIG_I2C_TARGET
-		else {
-			DL_I2C_disableInterrupt(config->base, TI_MSPM0_TARGET_INTERRUPTS);
-			DL_I2C_clearInterruptStatus(config->base, TI_MSPM0_TARGET_INTERRUPTS);
-			if (data->target_callbacks->stop) {
-				data->target_callbacks->stop(data->target_config);
-			}
-			i2c_mspm0_reset_peripheral_target(dev);
-			k_sem_give(data->i2c_busy_sem);
-		}
+		i2c_mspm0_reset_peripheral_target(dev);
+		k_sem_give(data->i2c_busy_sem);
 		break;
-#endif
 	default:
 		break;
 	}
+}
+#endif /* CONFIG_I2C_TARGET */
+
+static inline void i2c_mspm0_isr_controller(const struct device *dev)
+{
+	const struct i2c_mspm0_config *config = dev->config;
+	struct i2c_mspm0_data *data = dev->data;
+
+
+	switch (DL_I2C_getPendingInterrupt(config->base)) {
+	case DL_I2C_IIDX_CONTROLLER_STOP:
+		if (data->state == I2C_MSPM0_RX_INPROGRESS) {
+			data->state = I2C_MSPM0_RX_COMPLETE;
+			k_sem_give(data->device_sync_sem);
+		}
+		break;
+	case DL_I2C_IIDX_CONTROLLER_TX_DONE:
+		DL_I2C_disableInterrupt(config->base, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER);
+		data->state = I2C_MSPM0_TX_COMPLETE;
+		k_sem_give(data->device_sync_sem);
+		break;
+	case DL_I2C_IIDX_CONTROLLER_RXFIFO_TRIGGER:
+		/* Receive all bytes from target */
+		data->state = I2C_MSPM0_RX_INPROGRESS;
+		while (DL_I2C_isControllerRXFIFOEmpty(config->base) != true) {
+			if (data->transfer_count < data->transfer_len) {
+				data->msg_buf[data->transfer_count++] =
+					DL_I2C_receiveControllerData(config->base);
+			} else {
+				/* Ignore if transaction length exceeded */
+				DL_I2C_receiveControllerData(config->base);
+			}
+		}
+		break;
+	case DL_I2C_IIDX_CONTROLLER_TXFIFO_TRIGGER:
+		data->state = I2C_MSPM0_TX_INPROGRESS;
+		/* Fill TX FIFO with next bytes to send */
+		if (data->transfer_count < data->transfer_len) {
+			data->transfer_count += DL_I2C_fillControllerTXFIFO(
+				config->base, &data->msg_buf[data->transfer_count],
+				data->transfer_len - data->transfer_count);
+		}
+		k_sem_give(data->device_sync_sem);
+		break;
+	case DL_I2C_IIDX_CONTROLLER_NACK:
+		if ((data->state == I2C_MSPM0_RX_STARTED) ||
+		    (data->state == I2C_MSPM0_TX_STARTED)) {
+			/* NACK interrupt if I2C Target is disconnected */
+			data->state = I2C_MSPM0_ERROR;
+			k_sem_give(data->device_sync_sem);
+		}
+		break;
+	case DL_I2C_IIDX_TIMEOUT_A:
+		data->state = I2C_MSPM0_TIMEOUT;
+		DL_I2C_disableInterrupt(config->base, TI_MSPM0_CONTROLLER_INTERRUPTS);
+		DL_I2C_clearInterruptStatus(config->base, TI_MSPM0_CONTROLLER_INTERRUPTS);
+		DL_I2C_flushControllerTXFIFO(config->base);
+		k_sem_give(data->device_sync_sem);
+	default:
+		break;
+	}
+}
+
+static inline void i2c_mspm0_isr(const struct device *dev)
+{
+	struct i2c_mspm0_data *data = dev->data;
+
+	if (data->is_target == false) {
+		i2c_mspm0_isr_controller(dev);
+	}
+#if (IS_ENABLED(CONFIG_I2C_TARGET))
+	if (data->is_target) {
+		i2c_mspm0_isr_target(dev);
+	}
+#endif
+}
+
+static int i2c_mspm0_init(const struct device *dev)
+{
+	const struct i2c_mspm0_config *config = dev->config;
+	int ret;
+	uint32_t speed_config;
+
+	/* Init power */
+	DL_I2C_reset(config->base);
+	DL_I2C_enablePower(config->base);
+	delay_cycles(CONFIG_MSPM0_PERIPH_STARTUP_DELAY);
+	DL_I2C_resetControllerTransfer(config->base);
+#if (IS_ENABLED(CONFIG_I2C_TARGET))
+	/* Workaround for errata I2C_ERR_04 */
+	DL_I2C_disableTargetWakeup(config->base);
+#endif
+	/* Init GPIO */
+	ret = pinctrl_apply_state(config->pinctrl, PINCTRL_STATE_DEFAULT);
+	if (ret < 0) {
+		return ret;
+	}
+
+	/* Config clocks and analog filter */
+	DL_I2C_setClockConfig(config->base, &config->i2c_clock_config);
+
+	DL_I2C_disableAnalogGlitchFilter(config->base);
+
+	/* Set frequency */
+	speed_config = i2c_map_dt_bitrate(config->bitrate);
+	i2c_mspm0_configure(dev, speed_config);
+
+	/* Enable interrupts */
+	config->irq_config_func(dev);
+
+	return 0;
 }
 
 static DEVICE_API(i2c, i2c_mspm0_driver_api) = {
@@ -736,7 +792,7 @@ static DEVICE_API(i2c, i2c_mspm0_driver_api) = {
 #ifdef CONFIG_I2C_RTIO
 	.iodev_submit = i2c_iodev_submit_fallback,
 #endif
-#ifdef CONFIG_I2C_TARGET
+#if (IS_ENABLED(CONFIG_I2C_TARGET))
 	.target_register = i2c_mspm0_target_register,
 	.target_unregister = i2c_mspm0_target_unregister,
 #endif
@@ -769,17 +825,17 @@ static DEVICE_API(i2c, i2c_mspm0_driver_api) = {
 	I2C_MSPM0_CONFIG_IRQ_FUNC_DECLARE(index);                                                  \
                                                                                                    \
 	IF_ENABLED(USES_MERGE_BUF(index),                                                          \
-		(static uint8_t mspm0_i2c_##index_msg_buf[MERGE_BUF_SIZE(index)];));       \
+		(static uint8_t mspm0_i2c_msg_buf_##index[MERGE_BUF_SIZE(index)];));       \
 	static const struct i2c_mspm0_config i2c_mspm0_cfg_##index = {                             \
 		.base = (I2C_Regs *)DT_INST_REG_ADDR(index),                                       \
 		.clock_subsys = &mspm0_i2c_clockSys##index,                                        \
 		.bitrate = DT_INST_PROP(index, clock_frequency),                                   \
 		.merge_buf_size = MERGE_BUF_SIZE(index),                                           \
 		IF_ENABLED(USES_MERGE_BUF(index),                                                  \
-			(.merge_buf = mspm0_i2c_##index_msg_buf,)) .pinctrl =      \
+			(.merge_buf = mspm0_i2c_msg_buf_##index,)) .pinctrl =      \
 						   PINCTRL_DT_INST_DEV_CONFIG_GET(index),          \
 					  .irq_config_func = i2c_mspm0_irq_config_func_##index,    \
-					  .gI2CClockConfig = {                                     \
+					  .i2c_clock_config = {                                    \
 						  .clockSel = MSPM0_CLOCK_PERIPH_REG_MASK(         \
 							  DT_INST_CLOCKS_CELL(index, clk)),        \
 						  .divideRatio = DL_I2C_CLOCK_DIVIDE_1,            \
