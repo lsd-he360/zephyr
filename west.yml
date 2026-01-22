@@ -273,7 +273,8 @@ manifest:
       groups:
         - hal
     - name: hal_ti
-      revision: e66677c8c8d8b5e521c744f6b9788137b41b98fc
+      url: git@github.com:lsd-he360/hal_ti.git
+      revision: he360-wip
       path: modules/hal/ti
       groups:
         - hal
