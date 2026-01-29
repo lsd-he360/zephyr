@@ -1,0 +1,17 @@
+&spi0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+	pinctrl-0 = < &spi0_cs0_pa18 &spi0_sclk_pa12 &spi0_pico_pa14 &spi0_poci_pa7 >;
+	pinctrl-names = "default";
+	clocks = < &ckm 0x408 >;
+	clock-frequency = < 2000000 >;
+
+	cs-gpios = < &gpioa 2 GPIO_ACTIVE_LOW >;
+	dev: dev@0 {
+		reg = <0>;
+		label = "dev";
+        compatible = "vnd,spi-device";
+		spi-max-frequency = <10000000>;
+	};
+};
