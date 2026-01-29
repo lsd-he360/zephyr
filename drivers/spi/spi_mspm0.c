@@ -282,7 +282,8 @@ static int spi_mspm0_release(const struct device *dev, const struct spi_config *
 	return 0;
 }
 
-static const struct spi_driver_api spi_mspm0_api = {
+static DEVICE_API(spi, spi_mspm0_api) = {
+//static const struct spi_driver_api spi_mspm0_api = {
 	.transceive = spi_mspm0_transceive,
 	.release    = spi_mspm0_release,
 };
@@ -349,5 +350,6 @@ static int spi_mspm0_init(const struct device *dev)
 	DEVICE_DT_INST_DEFINE(inst, spi_mspm0_init, NULL, &spi_mspm0_data_##inst,		\
 			      &spi_mspm0_config_##inst, POST_KERNEL, CONFIG_SPI_INIT_PRIORITY,	\
 			      &spi_mspm0_api);
+
 
 DT_INST_FOREACH_STATUS_OKAY(MSPM0_SPI_INIT)
